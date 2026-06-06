@@ -1,0 +1,106 @@
+name: Build Haydn Kernel
+
+on:
+  push:
+    branches: [thirteen]
+  pull_request:
+    branches: [thirteen]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang-14 lld-14 llvm-14 \
+            gcc-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabihf \
+            make flex bison bc \
+            libssl-dev rsync cpio
+
+      - name: Show toolchains
+        run: |
+          clang-14 --version | head -1
+          aarch64-linux-gnu-gcc --version | head -1
+          arm-linux-gnueabihf-gcc --version | head -1
+
+      - name: Show DWC3 patch
+        run: |
+          echo "=== DWC3 EUD VBUS debounce changes ==="
+          git show --stat HEAD
+          echo ""
+          git diff HEAD~1..HEAD -- drivers/usb/dwc3/dwc3-msm.c || true
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export CC=clang-14
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabihf-
+
+          echo "=== Generating config ==="
+          make O=out vendor/haydn-qgki_defconfig
+
+          echo "=== Starting build ($(nproc) threads) ==="
+          make O=out -j$(nproc) \
+            CC=clang-14 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabihf- \
+            2>&1 | tee build.log
+
+      - name: Verify artifacts
+        run: |
+          echo "=========================================="
+          echo "  Haydn Kernel Build Summary"
+          echo "=========================================="
+          echo ""
+          if [ -f out/arch/arm64/boot/Image ]; then
+            echo "  [OK] Kernel Image built successfully"
+            ls -lh out/arch/arm64/boot/Image
+            file out/arch/arm64/boot/Image
+          else
+            echo "  [FAIL] Kernel Image NOT FOUND!"
+            echo ""
+            echo "  Last 40 lines of build log:"
+            tail -40 build.log
+            exit 1
+          fi
+
+      - name: Verify DWC3 symbols
+        run: |
+          echo "=== Checking DWC3 debounce symbols ==="
+          aarch64-linux-gnu-nm out/drivers/usb/dwc3/dwc3-msm.o | grep -E "vbus_debounce|debounce" || {
+            echo "WARNING: debounce symbols not found (may be inlined)"
+          }
+
+      - name: Upload kernel Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: haydn-kernel-Image
+          path: out/arch/arm64/boot/Image
+          retention-days: 30
+
+      - name: Upload kernel config
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config
+          path: out/.config
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7

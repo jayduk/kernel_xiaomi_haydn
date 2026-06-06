@@ -513,6 +513,8 @@ struct dwc3_msm {
 	struct pm_qos_request pm_qos_req_dma;
 	struct delayed_work perf_vote_work;
 	struct delayed_work sdp_check;
+	struct delayed_work vbus_debounce_work;
+	bool            vbus_debounce_pending;
 	struct mutex suspend_resume_mutex;
 
 	enum usb_device_speed override_usb_speed;
@@ -3705,6 +3707,34 @@ static void dwc3_ext_event_notify(struct dwc3_msm *mdwc)
 	queue_delayed_work(mdwc->sm_usb_wq, &mdwc->sm_work, 0);
 }
 
+#define VBUS_DEBOUNCE_MSEC 300
+
+static void dwc3_vbus_debounce_handler(struct work_struct *w)
+{
+	struct delayed_work *dwork = to_delayed_work(w);
+	struct dwc3_msm *mdwc = container_of(dwork, struct dwc3_msm,
+					     vbus_debounce_work);
+	struct dwc3 *dwc = platform_get_drvdata(mdwc->dwc3);
+
+	mdwc->vbus_debounce_pending = false;
+
+	/*
+	 * If VBUS came back while we were waiting, the VBUS-on path already
+	 * cancelled us and reset eud_active — nothing to do.
+	 */
+	if (mdwc->eud_active)
+		return;
+
+	/*
+	 * VBUS stayed off for the full debounce period.
+	 * This is a genuine disconnect — update state and run the state machine.
+	 */
+	mdwc->check_eud_state = true;
+	/* ext_idx already set by the notifier before it returned */
+	if (dwc->dr_mode == USB_DR_MODE_OTG && !mdwc->in_restart)
+		queue_work(mdwc->dwc3_wq, &mdwc->resume_work);
+}
+
 static void dwc3_resume_work(struct work_struct *w)
 {
 	struct dwc3_msm *mdwc = container_of(w, struct dwc3_msm, resume_work);
@@ -4103,10 +4133,41 @@ static int dwc3_msm_vbus_notifier(struct notifier_block *nb,
 	/* detect USB spoof disconnect/connect notification with EUD device */
 	eud_str = strnstr(edev_name, "eud", strlen(edev_name));
 	if (eud_str) {
-		if (mdwc->eud_active == event)
+		/*
+		 * PD power renegotiation on USB-C hubs causes EUD to fire
+		 * rapid VBUS toggles (1->0->1). Debounce VBUS-off: wait
+		 * VBUS_DEBOUNCE_MSEC before acting on a disconnect. If VBUS
+		 * returns within that window, cancel the timer and treat the
+		 * whole sequence as a transient glitch.
+		 */
+		if (event) {
+			/* VBUS on: cancel any pending debounce, process immediately */
+			if (mdwc->vbus_debounce_pending) {
+				cancel_delayed_work(&mdwc->vbus_debounce_work);
+				mdwc->vbus_debounce_pending = false;
+			}
+			if (mdwc->eud_active == event)
+				return NOTIFY_DONE;
+			mdwc->eud_active = event;
+			mdwc->check_eud_state = true;
+		} else {
+			/* VBUS off: debounce before acting */
+			if (mdwc->eud_active == event)
+				return NOTIFY_DONE;
+			if (mdwc->vbus_debounce_pending)
+				return NOTIFY_DONE;
+			mdwc->eud_active = event;
+			mdwc->vbus_debounce_pending = true;
+			queue_delayed_work(mdwc->dwc3_wq,
+					   &mdwc->vbus_debounce_work,
+					   msecs_to_jiffies(VBUS_DEBOUNCE_MSEC));
+			/*
+			 * Don't queue resume_work yet — let the debounce
+			 * handler do it if VBUS stays off.
+			 */
+			mdwc->ext_idx = enb->idx;
 			return NOTIFY_DONE;
-		mdwc->eud_active = event;
-		mdwc->check_eud_state = true;
+		}
 	} else {
 		if (mdwc->vbus_active == event)
 			return NOTIFY_DONE;
@@ -4728,6 +4789,8 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&mdwc->sm_work, dwc3_otg_sm_work);
 	INIT_DELAYED_WORK(&mdwc->perf_vote_work, msm_dwc3_perf_vote_work);
 	INIT_DELAYED_WORK(&mdwc->sdp_check, check_for_sdp_connection);
+	INIT_DELAYED_WORK(&mdwc->vbus_debounce_work, dwc3_vbus_debounce_handler);
+	mdwc->vbus_debounce_pending = false;
 
 	mdwc->dwc3_wq = alloc_ordered_workqueue("dwc3_wq", 0);
 	if (!mdwc->dwc3_wq) {
@@ -5191,6 +5254,7 @@ static int dwc3_msm_remove(struct platform_device *pdev)
 		clk_prepare_enable(mdwc->xo_clk);
 	}
 
+	cancel_delayed_work_sync(&mdwc->vbus_debounce_work);
 	cancel_delayed_work_sync(&mdwc->perf_vote_work);
 	cancel_delayed_work_sync(&mdwc->sm_work);
 
